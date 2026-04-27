@@ -1,4 +1,4 @@
-# indexer.py — scans local files and upserts into Chroma
+# indexer_v2.py — priority ordering and rich metadata
 
 import json
 import os
@@ -6,7 +6,6 @@ import hashlib
 from pathlib import Path
 from typing import List
 
-from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -14,6 +13,11 @@ from config import SUPPORTED_EXTENSIONS, CHUNK_SIZE, CHUNK_OVERLAP, CHROMA_DIR
 
 _HASH_STORE = Path(CHROMA_DIR) / "indexed_hashes.json"
 
+# Index these files before others in the same directory
+_PRIORITY_STEMS = {"readme", "index", "__init__", "main", "app"}
+
+
+# ── Hash persistence ────────────────────────────────────────────────────────
 
 def _load_hashes() -> set[str]:
     if _HASH_STORE.exists():
@@ -26,8 +30,9 @@ def _save_hashes(hashes: set[str]) -> None:
     _HASH_STORE.write_text(json.dumps(list(hashes)))
 
 
+# ── Hashing ──────────────────────────────────────────────────────────────────
+
 def _file_hash(path: str) -> str:
-    """MD5 of the file content — used to detect changes."""
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -35,8 +40,13 @@ def _file_hash(path: str) -> str:
     return h.hexdigest()
 
 
+def _priority_key(fname: str) -> int:
+    return 0 if Path(fname).stem.lower() in _PRIORITY_STEMS else 1
+
+
+# ── File loading ─────────────────────────────────────────────────────────────
+
 def _load_file(path: str) -> str:
-    """Load text from a file. Handles .pdf separately."""
     suffix = Path(path).suffix.lower()
 
     if suffix == ".pdf":
@@ -56,6 +66,8 @@ def _load_file(path: str) -> str:
         print(f"    ⚠️  Could not read {path}: {e}")
         return ""
 
+
+# ── Directory traversal ──────────────────────────────────────────────────────
 
 _SKIP_DIRS = {
     # Python
@@ -78,21 +90,26 @@ _SKIP_DIRS = {
     "chroma_db", "wordpress",
 }
 
+
 def _collect_files(directory: str) -> List[str]:
-    """Recursively find all supported files under directory, skipping junk folders."""
-    found = []
+    """Recursively collect supported files, priority files first within each folder."""
+    found: List[str] = []
     for root, dirs, files in os.walk(directory):
         dirs[:] = [d for d in dirs if d not in _SKIP_DIRS and not d.startswith(".")]
-        for fname in files:
-            if Path(fname).suffix.lower() in SUPPORTED_EXTENSIONS:
-                found.append(os.path.join(root, fname))
+        supported = [f for f in files if Path(f).suffix.lower() in SUPPORTED_EXTENSIONS]
+        found.extend(os.path.join(root, f) for f in sorted(supported, key=_priority_key))
     return found
 
 
+# ── Main entry point ──────────────────────────────────────────────────────────
+
 def index_files(vectorstore: Chroma, watch_dir: str) -> None:
     """
-    Walk watch_dir, skip already-indexed unchanged files,
-    split and embed new/changed files into the vector store.
+    Walk watch_dir and embed new/changed files into the vector store.
+    - Skips files whose hash is already stored (persisted across restarts)
+    - Indexes folder manifests first (coarse-grained, for two-level retrieval)
+    - Indexes priority files (README, index, __init__) before others per folder
+    - Attaches rich metadata: folder, filename, extension, depth, type
     """
     if not os.path.exists(watch_dir):
         print(f"    ⚠️  Watch directory '{watch_dir}' does not exist — creating it.")
@@ -121,9 +138,23 @@ def index_files(vectorstore: Chroma, watch_dir: str) -> None:
         if not text.strip():
             continue
 
+        p = Path(fpath)
+        try:
+            depth = len(p.relative_to(watch_dir).parts) - 1
+        except ValueError:
+            depth = 0
+
         chunks = splitter.create_documents(
             texts=[text],
-            metadatas=[{"source": fpath, "hash": fhash}],
+            metadatas=[{
+                "source":    fpath,
+                "hash":      fhash,
+                "folder":    str(p.parent),
+                "filename":  p.name,
+                "extension": p.suffix.lower(),
+                "depth":     depth,
+                "type":      "file",
+            }],
         )
 
         ids = [f"{fhash}_{i}" for i in range(len(chunks))]

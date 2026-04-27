@@ -18,7 +18,7 @@ from langchain_core.documents import Document
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 
-from indexer_v2 import index_files
+from indexer import index_files
 from config import (
     LM_STUDIO_BASE_URL,
     LM_STUDIO_MODEL,
@@ -54,9 +54,8 @@ class AgentState(TypedDict):
     messages:          Annotated[List[BaseMessage], add_messages]
     question:          str
     retrieved_docs:    List[Document]
-    relevant_folders:  List[str]
     generation:        str
-    route:             Literal["rag", "direct"]
+    route:             Literal["rag", "direct", "filesystem"]
     grounded:          bool
     retry_count:       int
 
@@ -91,53 +90,32 @@ def router_node(state: AgentState) -> AgentState:
     """LLM decides: does this question need file retrieval?"""
     print("🔀  Routing question...")
     system = (
-        "You are a router. Given a user question, decide whether answering it "
-        "requires searching local files and documents, or whether you can answer "
-        "directly from general knowledge.\n"
-        "Reply with ONLY one word: 'rag' or 'direct'."
+        "You are a router. Given a user question, decide the best way to answer it:\n"
+        "- 'filesystem': the user is asking about files or folders themselves — "
+        "listing contents, searching by name, checking what exists, finding specific "
+        "folders, asking what a directory contains, counting files, etc.\n"
+        "- 'rag': the user wants to search or ask questions about the *content inside* files "
+        "(e.g. 'what does my resume say', 'find documents about X')\n"
+        "- 'direct': the question is unrelated to local files\n"
+        "Reply with ONLY one word: 'filesystem', 'rag', or 'direct'."
     )
+
     answer = _call_llm(system, state["question"]).lower()
-    route = "rag" if "rag" in answer else "direct"
+    if "filesystem" in answer:
+        route = "filesystem"
+    elif "rag" in answer:
+        route = "rag"
+    else:
+        route = "direct"
     print(f"    → route: {route}")
     return {**state, "route": route}
 
-
-def manifest_retrieval_node(state: AgentState) -> AgentState:
-    """Search folder manifests to find which directories are most relevant."""
-    print("📁  Finding relevant folders...")
-    manifest_docs = vectorstore.similarity_search(
-        state["question"],
-        k=3,
-        filter={"type": {"$eq": "folder_manifest"}},
-    )
-    relevant_folders = [doc.metadata["folder"] for doc in manifest_docs]
-    print(f"    → {len(relevant_folders)} relevant folder(s): {relevant_folders}")
-    return {**state, "relevant_folders": relevant_folders}
-
-
 def retrieval_node(state: AgentState) -> AgentState:
-    """Pull top-k file chunks, filtered to relevant folders when available."""
+    """Pull top-k file chunks from the vector store."""
     print("🔍  Retrieving chunks...")
-    question = state["question"]
-    folders = state.get("relevant_folders", [])
-
-    if folders:
-        docs = vectorstore.similarity_search(
-            question,
-            k=TOP_K,
-            filter={"$and": [{"folder": {"$in": folders}}, {"type": {"$eq": "file"}}]},
-        )
-        # Fall back to global search if the folder filter returned nothing
-        if not docs:
-            print("    → folder filter empty, falling back to global search")
-            docs = vectorstore.similarity_search(
-                question, k=TOP_K, filter={"type": {"$eq": "file"}}
-            )
-    else:
-        docs = vectorstore.similarity_search(
-            question, k=TOP_K, filter={"type": {"$eq": "file"}}
-        )
-
+    docs = vectorstore.similarity_search(
+        state["question"], k=TOP_K, filter={"type": {"$eq": "file"}}
+    )
     print(f"    → {len(docs)} chunks retrieved")
     return {**state, "retrieved_docs": docs}
 
@@ -222,14 +200,56 @@ def hallucination_check_node(state: AgentState) -> AgentState:
     return {**state, "grounded": grounded}
 
 
+def filesystem_node(state: AgentState) -> AgentState:
+    """Answer any filesystem question by scanning the relevant directory."""
+    print("📂  Answering filesystem question...")
+    question = state["question"]
+
+    path_str = _call_llm(
+        f"Extract the directory path the user is asking about from their question. "
+        f"If they mention 'desktop', return '{WATCH_DIR}'. "
+        f"If no specific path is mentioned, return '{WATCH_DIR}'. "
+        f"Return ONLY the absolute path, nothing else.",
+        question,
+    ).strip()
+
+    target = path_str if os.path.isdir(path_str) else WATCH_DIR
+    print(f"    → scanning: {target}")
+
+    try:
+        entries = os.listdir(target)
+        folders = sorted(e for e in entries if os.path.isdir(os.path.join(target, e)))
+        files   = sorted(e for e in entries if os.path.isfile(os.path.join(target, e)))
+
+        listing = (
+            f"Directory: {target}\n\n"
+            f"Folders ({len(folders)}):\n" +
+            ("\n".join(f"  {f}/" for f in folders) or "  (none)") +
+            f"\n\nFiles ({len(files)}):\n" +
+            ("\n".join(f"  {f}" for f in files) or "  (none)")
+        )
+    except PermissionError:
+        listing = f"Permission denied: cannot access {target}"
+    except FileNotFoundError:
+        listing = f"Directory not found: {target}"
+
+    answer = _call_llm(
+        f"You have access to the following directory listing. "
+        f"Answer the user's question using it.\n\n{listing}",
+        question,
+        history=state["messages"],
+    )
+    return {**state, "generation": answer, "messages": [AIMessage(content=answer)]}
+
+
 # ── Conditional edge functions ─────────────────────────────────────────────
 
-def route_after_router(state: AgentState) -> Literal["file_indexer_node", "direct_answer_node"]:
-    return "file_indexer_node" if state["route"] == "rag" else "direct_answer_node"
-
-
-
-
+def route_after_router(state: AgentState) -> Literal["file_indexer_node", "direct_answer_node", "filesystem_node"]:
+    if state["route"] == "rag":
+        return "file_indexer_node"
+    if state["route"] == "filesystem":
+        return "filesystem_node"
+    return "direct_answer_node"
 
 def route_after_grading(state: AgentState) -> Literal["generate_node", "rag_reflection_node"]:
     """If chunks look good, generate. Otherwise loop back to grade again after rewrite."""
@@ -237,12 +257,10 @@ def route_after_grading(state: AgentState) -> Literal["generate_node", "rag_refl
         return "generate_node"
     return "rag_reflection_node"   # will rewrite inside rag_reflection_node
 
-
 def route_after_hallucination_check(state: AgentState) -> Literal["generate_node", "__end__"]:
     if state["grounded"] or state["retry_count"] >= MAX_RETRIES:
         return "__end__"
     return "generate_node"
-
 
 # ── Build graph ────────────────────────────────────────────────────────────
 
@@ -251,23 +269,23 @@ def build_graph() -> StateGraph:
 
     g.add_node("file_indexer_node",        file_indexer_node)
     g.add_node("router_node",              router_node)
-    g.add_node("manifest_retrieval_node",  manifest_retrieval_node)
     g.add_node("retrieval_node",           retrieval_node)
     g.add_node("rag_reflection_node",      rag_reflection_node)
     g.add_node("generate_node",            generate_node)
+    g.add_node("filesystem_node",          filesystem_node)
     g.add_node("direct_answer_node",       direct_answer_node)
     # g.add_node("hallucination_check_node", hallucination_check_node)
 
     g.add_edge(START,                       "router_node")
     g.add_conditional_edges("router_node",  route_after_router)
 
-    g.add_edge("file_indexer_node",         "manifest_retrieval_node")
-    g.add_edge("manifest_retrieval_node",   "retrieval_node")
+    g.add_edge("file_indexer_node",         "retrieval_node")
     g.add_edge("retrieval_node",            "rag_reflection_node")
     g.add_conditional_edges("rag_reflection_node", route_after_grading)
     g.add_edge("generate_node",             END)
     # g.add_conditional_edges("hallucination_check_node", route_after_hallucination_check)
 
+    g.add_edge("filesystem_node",           END)
     g.add_edge("direct_answer_node",        END)
 
     return g.compile()
@@ -282,7 +300,6 @@ def ask(question: str, history: List[BaseMessage] | None = None) -> tuple[str, L
         "messages":          prior + [HumanMessage(content=question)],
         "question":          question,
         "retrieved_docs":    [],
-        "relevant_folders":  [],
         "generation":        "",
         "route":             "rag",
         "grounded":          False,
