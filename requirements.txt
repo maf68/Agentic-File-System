@@ -1,0 +1,19 @@
+# requirements.txt
+
+# LangGraph + LangChain core
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0          # for ChatOpenAI pointing at LM Studio
+langchain-community>=0.3.0       # for HuggingFaceEmbeddings, PyPDFLoader
+langchain-chroma>=0.1.0          # Chroma vector store integration
+langchain-text-splitters>=0.3.0
+
+# Local embeddings
+sentence-transformers>=3.0.0
+
+# Vector store
+chromadb>=0.5.0
+
+# PDF support (optional — only needed if you have .pdf files)
+pypdf>=4.0.0
