@@ -82,4 +82,3 @@ Router         → LLM decides: needs file retrieval, or can answer directly?
 - **Chroma persists**: The `chroma_db/` folder is written to disk. Delete it to
   force a full re-index.
 # Agentic-File-System
-# Agentic-File-System
