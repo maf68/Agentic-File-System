@@ -1,6 +1,6 @@
 # Local RAG Agent
 
-Fully local RAG agent built with LangGraph.
+RAG agent for local folders and files built with LangGraph.
 - **LLM**: LM Studio (any model you have loaded)
 - **Embeddings**: `all-MiniLM-L6-v2` via sentence-transformers — runs on CPU, no GPU needed
 - **Vector store**: Chroma, persisted to disk
